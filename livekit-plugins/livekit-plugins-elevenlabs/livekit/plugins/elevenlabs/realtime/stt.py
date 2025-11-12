@@ -292,40 +292,72 @@ class RealtimeSpeechStream(stt.SpeechStream):
             )
 
             has_ended = False
-            async for data in self._input_ch:
-                frames: list[rtc.AudioFrame] = []
-                if isinstance(data, rtc.AudioFrame):
-                    frames.extend(audio_bstream.write(data.data.tobytes()))
-                elif isinstance(data, self._FlushSentinel):
-                    frames.extend(audio_bstream.flush())
-                    has_ended = True
+            try:
+                async for data in self._input_ch:
+                    # Check if connection is still alive before processing
+                    if closing_ws or ws.closed:
+                        logger.debug("Connection closed, stopping audio send")
+                        break
 
-                for frame in frames:
-                    # Only send audio if session is started
-                    if not self._session_started:
-                        logger.debug("Waiting for session to start before sending audio")
-                        await asyncio.sleep(0.1)
-                        continue
+                    frames: list[rtc.AudioFrame] = []
+                    if isinstance(data, rtc.AudioFrame):
+                        frames.extend(audio_bstream.write(data.data.tobytes()))
+                    elif isinstance(data, self._FlushSentinel):
+                        frames.extend(audio_bstream.flush())
+                        has_ended = True
 
-                    # Convert to base64 and send
-                    chunk_base64 = base64.b64encode(frame.data.tobytes()).decode("utf-8")
-                    message = {
-                        "message_type": "input_audio_chunk",
-                        "audio_base_64": chunk_base64,
-                        "commit": False,
-                        "sample_rate": self._opts.sample_rate,
-                    }
-                    logger.debug(f"Sending audio chunk: {len(chunk_base64)} chars")
-                    await ws.send_str(json.dumps(message))
+                    for frame in frames:
+                        # Check connection before each send
+                        if closing_ws or ws.closed:
+                            logger.debug("Connection closed, stopping audio send")
+                            break
 
-                    if has_ended:
-                        # Send commit message when ending
+                        # Only send audio if session is started
+                        if not self._session_started:
+                            logger.debug("Waiting for session to start before sending audio")
+                            await asyncio.sleep(0.05)  # Shorter wait
+                            continue
+
+                        # Convert to base64 and send
+                        chunk_base64 = base64.b64encode(frame.data.tobytes()).decode("utf-8")
+                        message = {
+                            "message_type": "input_audio_chunk",
+                            "audio_base_64": chunk_base64,
+                            "commit": False,
+                            "sample_rate": self._opts.sample_rate,
+                        }
+
+                        try:
+                            await ws.send_str(json.dumps(message))
+                            logger.debug(f"Sent audio chunk: {len(chunk_base64)} chars")
+                        except (aiohttp.ClientConnectionResetError, ConnectionResetError) as e:
+                            logger.debug(f"Connection reset while sending audio: {e}")
+                            closing_ws = True
+                            break
+                        except Exception as e:
+                            logger.error(f"Error sending audio: {e}")
+                            closing_ws = True
+                            break
+
+                        if has_ended:
+                            # Send commit message when ending
+                            try:
+                                await ws.send_str(RealtimeSpeechStream._CLOSE_MSG)
+                            except Exception as e:
+                                logger.debug(f"Error sending close message: {e}")
+                            has_ended = False
+
+                # tell elevenlabs we are done sending audio/inputs
+                if not closing_ws and not ws.closed:
+                    closing_ws = True
+                    try:
                         await ws.send_str(RealtimeSpeechStream._CLOSE_MSG)
-                        has_ended = False
+                    except Exception as e:
+                        logger.debug(f"Error sending final close message: {e}")
 
-            # tell elevenlabs we are done sending audio/inputs
-            closing_ws = True
-            await ws.send_str(RealtimeSpeechStream._CLOSE_MSG)
+            except Exception as e:
+                logger.error(f"Send task error: {e}")
+                closing_ws = True
 
         @utils.log_exceptions(logger=logger)
         async def recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
