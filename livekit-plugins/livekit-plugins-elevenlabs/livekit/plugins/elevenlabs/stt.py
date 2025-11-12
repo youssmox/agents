@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import os
 from dataclasses import dataclass
+from typing import Optional
 
 import aiohttp
 
@@ -43,6 +44,14 @@ class _STTOptions:
     base_url: str
     language_code: str | None = None
     tag_audio_events: bool = True
+    # realtime defaults (used by realtime module)
+    realtime_model_id: str = "scribe_v2_realtime"
+    sample_rate: int = 16000
+    commit_strategy: str = "vad"  # "vad" or "manual"
+    vad_silence_threshold_secs: Optional[float] = None
+    vad_threshold: Optional[float] = None
+    min_speech_duration_ms: Optional[int] = None
+    min_silence_duration_ms: Optional[int] = None
 
 
 class STT(stt.STT):
@@ -170,3 +179,5 @@ class STT(stt.STT):
                 )
             ],
         )
+
+# Note: Realtime streaming support is implemented in livekit.plugins.elevenlabs.realtime.stt
