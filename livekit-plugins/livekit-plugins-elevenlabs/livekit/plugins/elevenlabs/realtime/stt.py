@@ -243,6 +243,8 @@ class SpeechStreamRealtime(stt.SpeechStream):
             self._opts.base_url = base_url  # type: ignore
 
     async def _run(self) -> None:
+        closed_event = asyncio.Event()
+
         async def send_task(ws: aiohttp.ClientWebSocketResponse) -> None:
             samples_50ms = self._opts.sample_rate // 20
             bstream = audio_utils.AudioByteStream(
@@ -252,6 +254,8 @@ class SpeechStreamRealtime(stt.SpeechStream):
             )
             pending_commit = False
             async for data in self._input_ch:
+                if closed_event.is_set() or ws.closed:
+                    return
                 frames: list[rtc.AudioFrame] = []
                 if isinstance(data, rtc.AudioFrame):
                     frames.extend(bstream.write(data.data.tobytes()))
@@ -260,37 +264,50 @@ class SpeechStreamRealtime(stt.SpeechStream):
                     pending_commit = True
 
                 for frame in frames:
+                    if closed_event.is_set() or ws.closed:
+                        return
                     self._usage_collector.push(frame.duration)
                     chunk_b64 = base64.b64encode(frame.data.tobytes()).decode("utf-8")
-                    await ws.send_str(
-                        json.dumps(
-                            {
-                                "message_type": "input_audio_chunk",
-                                "audio_base_64": chunk_b64,
-                                "commit": False,
-                                "sample_rate": self._opts.sample_rate,
-                            }
+                    try:
+                        await ws.send_str(
+                            json.dumps(
+                                {
+                                    "message_type": "input_audio_chunk",
+                                    "audio_base_64": chunk_b64,
+                                    "commit": False,
+                                    "sample_rate": self._opts.sample_rate,
+                                }
+                            )
                         )
-                    )
+                    except Exception:
+                        logger.warning("failed to send audio chunk to elevenlabs (ws likely closing)", exc_info=True)
+                        return
 
                 if pending_commit:
                     pending_commit = False
-                    await ws.send_str(
-                        json.dumps(
-                            {
-                                "message_type": "input_audio_chunk",
-                                "audio_base_64": "",
-                                "commit": True,
-                                "sample_rate": self._opts.sample_rate,
-                            }
+                    if closed_event.is_set() or ws.closed:
+                        return
+                    try:
+                        await ws.send_str(
+                            json.dumps(
+                                {
+                                    "message_type": "input_audio_chunk",
+                                    "audio_base_64": "",
+                                    "commit": True,
+                                    "sample_rate": self._opts.sample_rate,
+                                }
+                            )
                         )
-                    )
+                    except Exception:
+                        logger.warning("failed to send commit to elevenlabs (ws likely closing)", exc_info=True)
+                        return
                     self._usage_collector.flush()
 
         async def recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
             while True:
                 msg = await ws.receive()
                 if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING):
+                    closed_event.set()
                     return
 
                 if msg.type != aiohttp.WSMsgType.TEXT:
