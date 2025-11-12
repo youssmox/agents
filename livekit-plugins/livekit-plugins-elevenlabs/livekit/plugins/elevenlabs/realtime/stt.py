@@ -382,11 +382,12 @@ class RealtimeSpeechStream(stt.SpeechStream):
 
     async def _connect_ws(self) -> aiohttp.ClientWebSocketResponse:
         # Build WebSocket URL with query parameters
+        model_value = self._opts.model.value if isinstance(self._opts.model, RealtimeModels) else self._opts.model
         params = [
-            f"model_id={self._opts.model}",
+            f"model_id={model_value}",
             f"encoding={self._opts.audio_format.value}",
             f"sample_rate={self._opts.sample_rate}",
-            f"commit_strategy={self._opts.commit_strategy.value}",
+            f"commit_strategy={self._opts.commit_strategy.value}"
         ]
 
         # Add optional VAD parameters
@@ -404,6 +405,8 @@ class RealtimeSpeechStream(stt.SpeechStream):
         query_string = "&".join(params)
         ws_url = f"{self._opts.base_url}/v1/speech-to-text/realtime?{query_string}"
 
+        logger.debug(f"Connecting to ElevenLabs realtime WebSocket: {ws_url}")
+
         try:
             ws = await asyncio.wait_for(
                 self._session.ws_connect(
@@ -413,8 +416,13 @@ class RealtimeSpeechStream(stt.SpeechStream):
                 ),
                 self._conn_options.timeout,
             )
+            logger.debug("Successfully connected to ElevenLabs realtime WebSocket")
         except (aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:
+            logger.error(f"Failed to connect to ElevenLabs: {e}")
             raise APIConnectionError("failed to connect to elevenlabs") from e
+        except Exception as e:
+            logger.error(f"Unexpected error connecting to ElevenLabs: {e}")
+            raise APIConnectionError(f"unexpected error: {e}") from e
         return ws
 
     def _send_transcript_event(self, event_type: stt.SpeechEventType, data: dict) -> None:
