@@ -251,9 +251,10 @@ class SpeechStreamRealtime(stt.SpeechStream):
         while True:
             closed_event = asyncio.Event()
             closing_ws = False
+            first_audio_sent = False
 
             async def send_task(ws: aiohttp.ClientWebSocketResponse) -> None:
-                nonlocal closing_ws
+                nonlocal closing_ws, first_audio_sent
                 samples_50ms = self._opts.sample_rate // 20
                 bstream = audio_utils.AudioByteStream(
                     sample_rate=self._opts.sample_rate,
@@ -287,6 +288,7 @@ class SpeechStreamRealtime(stt.SpeechStream):
                                     }
                                 )
                             )
+                            first_audio_sent = True
                             await asyncio.sleep(0.01)
                         except Exception:
                             logger.warning("failed to send audio chunk to elevenlabs (ws likely closing)", exc_info=True)
@@ -313,6 +315,29 @@ class SpeechStreamRealtime(stt.SpeechStream):
                             return
                         self._usage_collector.flush()
                 closing_ws = True
+
+            async def keepalive_task(ws: aiohttp.ClientWebSocketResponse) -> None:
+                # send tiny silence packets until we see first real audio to prevent idle close
+                samples_50ms = self._opts.sample_rate // 20
+                silence_b64 = base64.b64encode(b"\x00\x00" * samples_50ms).decode("utf-8")
+                try:
+                    while (not first_audio_sent) and (not closed_event.is_set()) and (not ws.closed):
+                        try:
+                            await ws.send_str(
+                                _json.dumps(
+                                    {
+                                        "message_type": "input_audio_chunk",
+                                        "audio_base_64": silence_b64,
+                                        "commit": False,
+                                        "sample_rate": self._opts.sample_rate,
+                                    }
+                                )
+                            )
+                        except Exception:
+                            return
+                        await asyncio.sleep(0.4)
+                except Exception:
+                    return
 
             async def recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
                 while True:
@@ -347,8 +372,9 @@ class SpeechStreamRealtime(stt.SpeechStream):
                 self._ws = ws
                 send = asyncio.create_task(send_task(ws))
                 recv = asyncio.create_task(recv_task(ws))
+                keepalive = asyncio.create_task(keepalive_task(ws))
                 wait_reconnect = asyncio.create_task(self._reconnect_event.wait())
-                group = asyncio.gather(send, recv)
+                group = asyncio.gather(send, recv, keepalive)
                 try:
                     done, _ = await asyncio.wait((group, wait_reconnect), return_when=asyncio.FIRST_COMPLETED)
                     for t in done:
@@ -361,7 +387,7 @@ class SpeechStreamRealtime(stt.SpeechStream):
                         # normal exit
                         break
                 finally:
-                    for t in (send, recv, wait_reconnect):
+                    for t in (send, recv, keepalive, wait_reconnect):
                         if not t.done():
                             t.cancel()
                     try:
