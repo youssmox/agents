@@ -245,23 +245,26 @@ class SpeechStreamRealtime(stt.SpeechStream):
         self._reconnect_event.set()
 
     async def _run(self) -> None:
-        # Reconnection loop
+        # Minimal reconnection loop with lazy-connect on first audio
         import json as _json
-        closed_event: asyncio.Event
         while True:
-            closed_event = asyncio.Event()
             closing_ws = False
-            first_audio_sent = False
+
+            # Build chunker and await first audio before connecting
+            samples_50ms = self._opts.sample_rate // 20
+            bstream = audio_utils.AudioByteStream(
+                sample_rate=self._opts.sample_rate,
+                num_channels=1,
+                samples_per_channel=samples_50ms,
+            )
 
             def _to_mono_bytes(frame: rtc.AudioFrame) -> bytes:
-                # Ensure 16-bit mono PCM little-endian
                 if frame.num_channels == 1:
                     return frame.data.tobytes()
                 try:
                     import array
                     samples = array.array('h', frame.data.tobytes())
                     out = array.array('h')
-                    # interleaved stereo -> average L and R
                     for i in range(0, len(samples), frame.num_channels):
                         s = 0
                         for c in range(frame.num_channels):
@@ -271,55 +274,61 @@ class SpeechStreamRealtime(stt.SpeechStream):
                 except Exception:
                     return frame.data.tobytes()
 
-            async def send_task(ws: aiohttp.ClientWebSocketResponse) -> None:
-                nonlocal closing_ws, first_audio_sent
-                samples_50ms = self._opts.sample_rate // 20
-                bstream = audio_utils.AudioByteStream(
-                    sample_rate=self._opts.sample_rate,
-                    num_channels=1,
-                    samples_per_channel=samples_50ms,
-                )
-                pending_commit = False
-                async for data in self._input_ch:
-                    if closed_event.is_set() or ws.closed:
-                        return
-                    frames: list[rtc.AudioFrame] = []
-                    if isinstance(data, rtc.AudioFrame):
-                        mono_bytes = _to_mono_bytes(data)
-                        frames.extend(bstream.write(mono_bytes))
-                    elif isinstance(data, self._FlushSentinel):
-                        frames.extend(bstream.flush())
-                        pending_commit = True
+            # Wait for the very first piece of input to avoid idle-close
+            first_frames: list[rtc.AudioFrame] = []
+            while not first_frames:
+                data = await self._input_ch.__anext__()
+                if isinstance(data, rtc.AudioFrame):
+                    first_frames.extend(bstream.write(_to_mono_bytes(data)))
+                elif isinstance(data, self._FlushSentinel):
+                    first_frames.extend(bstream.flush())
 
-                    for frame in frames:
-                        if closed_event.is_set() or ws.closed:
-                            return
+            # Connect after we have real audio to send immediately
+            ws: aiohttp.ClientWebSocketResponse | None = None
+            try:
+                ws = await self._connect_ws()
+                self._ws = ws
+
+                async def send_task() -> None:
+                    nonlocal closing_ws
+                    # send first buffered frames immediately
+                    for frame in first_frames:
                         self._usage_collector.push(frame.duration)
                         chunk_b64 = base64.b64encode(frame.data.tobytes()).decode("utf-8")
-                        try:
-                            await ws.send_str(
-                                _json.dumps(
-                                    {
-                                        "message_type": "input_audio_chunk",
-                                        "audio_base_64": chunk_b64,
-                                        "commit": False,
-                                        "sample_rate": self._opts.sample_rate,
-                                    }
-                                )
+                        await ws.send_str(
+                            _json.dumps(
+                                {
+                                    "message_type": "input_audio_chunk",
+                                    "audio_base_64": chunk_b64,
+                                    "commit": False,
+                                    "sample_rate": self._opts.sample_rate,
+                                }
                             )
-                            if not first_audio_sent:
-                                logger.debug("elevenlabs first audio chunk sent")
-                            first_audio_sent = True
-                            await asyncio.sleep(0.01)
-                        except Exception:
-                            logger.warning("failed to send audio chunk to elevenlabs (ws likely closing)", exc_info=True)
-                            return
+                        )
+                        await asyncio.sleep(0.01)
 
-                    if pending_commit:
-                        pending_commit = False
-                        if closed_event.is_set() or ws.closed:
-                            return
-                        try:
+                    # continue streaming
+                    async for data in self._input_ch:
+                        frames: list[rtc.AudioFrame] = []
+                        if isinstance(data, rtc.AudioFrame):
+                            frames.extend(bstream.write(_to_mono_bytes(data)))
+                        elif isinstance(data, self._FlushSentinel):
+                            frames.extend(bstream.flush())
+                            # send commit after flush
+                            for frame in frames:
+                                self._usage_collector.push(frame.duration)
+                                chunk_b64 = base64.b64encode(frame.data.tobytes()).decode("utf-8")
+                                await ws.send_str(
+                                    _json.dumps(
+                                        {
+                                            "message_type": "input_audio_chunk",
+                                            "audio_base_64": chunk_b64,
+                                            "commit": False,
+                                            "sample_rate": self._opts.sample_rate,
+                                        }
+                                    )
+                                )
+                                await asyncio.sleep(0.01)
                             await ws.send_str(
                                 _json.dumps(
                                     {
@@ -330,91 +339,53 @@ class SpeechStreamRealtime(stt.SpeechStream):
                                     }
                                 )
                             )
-                            await asyncio.sleep(0.01)
-                        except Exception:
-                            logger.warning("failed to send commit to elevenlabs (ws likely closing)", exc_info=True)
-                            return
-                        self._usage_collector.flush()
-                closing_ws = True
+                            self._usage_collector.flush()
+                            continue
 
-            async def keepalive_task(ws: aiohttp.ClientWebSocketResponse) -> None:
-                # send tiny silence packets until we see first real audio to prevent idle close
-                samples_50ms = self._opts.sample_rate // 20
-                silence_b64 = base64.b64encode(b"\x00\x00" * samples_50ms).decode("utf-8")
-                try:
-                    while (not first_audio_sent) and (not closed_event.is_set()) and (not ws.closed):
-                        try:
+                        for frame in frames:
+                            self._usage_collector.push(frame.duration)
+                            chunk_b64 = base64.b64encode(frame.data.tobytes()).decode("utf-8")
                             await ws.send_str(
                                 _json.dumps(
                                     {
                                         "message_type": "input_audio_chunk",
-                                        "audio_base_64": silence_b64,
+                                        "audio_base_64": chunk_b64,
                                         "commit": False,
                                         "sample_rate": self._opts.sample_rate,
                                     }
                                 )
                             )
-                        except Exception:
-                            return
-                        await asyncio.sleep(0.4)
-                except Exception:
-                    return
+                            await asyncio.sleep(0.01)
 
-            async def recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
-                while True:
-                    msg = await ws.receive()
-                    if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING):
-                        closed_event.set()
-                        if closing_ws or self._session.closed:
-                            return
-                        logger.warning(
-                            "elevenlabs websocket closed unexpectedly",
-                            extra={"code": ws.close_code, "reason": getattr(ws, "close_reason", None)},
-                        )
-                        raise APIStatusError(
-                            message=f"elevenlabs connection closed (code={ws.close_code}, reason={getattr(ws, 'close_reason', None)})",
-                            status_code=ws.close_code or -1,
-                        )
-                    if msg.type == aiohttp.WSMsgType.ERROR:
-                        closed_event.set()
-                        logger.warning("elevenlabs websocket error", extra={"exception": ws.exception()})
-                        raise APIStatusError(message="elevenlabs websocket error", status_code=-1)
-                    if msg.type != aiohttp.WSMsgType.TEXT:
-                        logger.warning("unexpected elevenlabs message type %s", msg.type)
-                        continue
-                    try:
+                    closing_ws = True
+
+                async def recv_task() -> None:
+                    while True:
+                        msg = await ws.receive()
+                        if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING):
+                            if closing_ws or self._session.closed:
+                                return
+                            raise APIStatusError(
+                                message=f"elevenlabs connection closed (code={ws.close_code}, reason={getattr(ws, 'close_reason', None)})",
+                                status_code=ws.close_code or -1,
+                            )
+                        if msg.type == aiohttp.WSMsgType.ERROR:
+                            raise APIStatusError(message="elevenlabs websocket error", status_code=-1)
+                        if msg.type != aiohttp.WSMsgType.TEXT:
+                            continue
                         self._process_stream_event(_json.loads(msg.data))
-                    except Exception:
-                        logger.exception("failed to process elevenlabs message")
 
-            ws: aiohttp.ClientWebSocketResponse | None = None
-            try:
-                ws = await self._connect_ws()
-                self._ws = ws
-                send = asyncio.create_task(send_task(ws))
-                recv = asyncio.create_task(recv_task(ws))
-                keepalive = asyncio.create_task(keepalive_task(ws))
-                wait_reconnect = asyncio.create_task(self._reconnect_event.wait())
-                group = asyncio.gather(send, recv, keepalive)
+                send = asyncio.create_task(send_task())
+                recv = asyncio.create_task(recv_task())
+                group = asyncio.gather(send, recv)
                 try:
-                    done, _ = await asyncio.wait((group, wait_reconnect), return_when=asyncio.FIRST_COMPLETED)
-                    for t in done:
-                        if t is not wait_reconnect:
-                            t.result()
-                    if wait_reconnect in done:
-                        self._reconnect_event.clear()
-                        # fallthrough to finally to close and reconnect
-                    else:
-                        # normal exit
-                        break
+                    await group
+                    # normal end
+                    break
                 finally:
-                    for t in (send, recv, keepalive, wait_reconnect):
+                    for t in (send, recv):
                         if not t.done():
                             t.cancel()
-                    try:
-                        await group
-                    except Exception:
-                        pass
             finally:
                 if ws is not None:
                     await ws.close()
