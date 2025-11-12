@@ -253,6 +253,24 @@ class SpeechStreamRealtime(stt.SpeechStream):
             closing_ws = False
             first_audio_sent = False
 
+            def _to_mono_bytes(frame: rtc.AudioFrame) -> bytes:
+                # Ensure 16-bit mono PCM little-endian
+                if frame.num_channels == 1:
+                    return frame.data.tobytes()
+                try:
+                    import array
+                    samples = array.array('h', frame.data.tobytes())
+                    out = array.array('h')
+                    # interleaved stereo -> average L and R
+                    for i in range(0, len(samples), frame.num_channels):
+                        s = 0
+                        for c in range(frame.num_channels):
+                            s += samples[i + c]
+                        out.append(int(s / frame.num_channels))
+                    return out.tobytes()
+                except Exception:
+                    return frame.data.tobytes()
+
             async def send_task(ws: aiohttp.ClientWebSocketResponse) -> None:
                 nonlocal closing_ws, first_audio_sent
                 samples_50ms = self._opts.sample_rate // 20
@@ -267,7 +285,8 @@ class SpeechStreamRealtime(stt.SpeechStream):
                         return
                     frames: list[rtc.AudioFrame] = []
                     if isinstance(data, rtc.AudioFrame):
-                        frames.extend(bstream.write(data.data.tobytes()))
+                        mono_bytes = _to_mono_bytes(data)
+                        frames.extend(bstream.write(mono_bytes))
                     elif isinstance(data, self._FlushSentinel):
                         frames.extend(bstream.flush())
                         pending_commit = True
@@ -288,6 +307,8 @@ class SpeechStreamRealtime(stt.SpeechStream):
                                     }
                                 )
                             )
+                            if not first_audio_sent:
+                                logger.debug("elevenlabs first audio chunk sent")
                             first_audio_sent = True
                             await asyncio.sleep(0.01)
                         except Exception:
