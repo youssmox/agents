@@ -33,6 +33,29 @@ __all__ = [
     "__version__",
 ]
 
+# Export realtime STT classes
+try:
+    from .realtime import (
+        RealtimeSTT,
+        RealtimeSpeechStream,
+        RealtimeModels,
+        AudioFormat,
+        CommitStrategy,
+    )
+
+    __all__.extend(
+        [
+            "RealtimeSTT",
+            "RealtimeSpeechStream",
+            "RealtimeModels",
+            "AudioFormat",
+            "CommitStrategy",
+        ]
+    )
+except ImportError:
+    # realtime dependencies not available
+    pass
+
 from livekit.agents import Plugin
 
 from .log import logger
