@@ -209,6 +209,7 @@ class SpeechStreamRealtime(stt.SpeechStream):
         self._request_id = ""
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._usage_collector = _DurationCollector(self._on_audio_duration_report, duration=5.0)
+        self._reconnect_event = asyncio.Event()
 
     def update_options(
         self,
@@ -241,97 +242,135 @@ class SpeechStreamRealtime(stt.SpeechStream):
             self._opts.language_code = language_code  # type: ignore
         if is_given(base_url):
             self._opts.base_url = base_url  # type: ignore
+        self._reconnect_event.set()
 
     async def _run(self) -> None:
-        closed_event = asyncio.Event()
-        closing_ws = False
+        # Reconnection loop
+        import json as _json
+        closed_event: asyncio.Event
+        while True:
+            closed_event = asyncio.Event()
+            closing_ws = False
 
-        async def send_task(ws: aiohttp.ClientWebSocketResponse) -> None:
-            samples_50ms = self._opts.sample_rate // 20
-            bstream = audio_utils.AudioByteStream(
-                sample_rate=self._opts.sample_rate,
-                num_channels=1,
-                samples_per_channel=samples_50ms,
-            )
-            pending_commit = False
-            async for data in self._input_ch:
-                if closed_event.is_set() or ws.closed:
-                    return
-                frames: list[rtc.AudioFrame] = []
-                if isinstance(data, rtc.AudioFrame):
-                    frames.extend(bstream.write(data.data.tobytes()))
-                elif isinstance(data, self._FlushSentinel):
-                    frames.extend(bstream.flush())
-                    pending_commit = True
-
-                for frame in frames:
+            async def send_task(ws: aiohttp.ClientWebSocketResponse) -> None:
+                nonlocal closing_ws
+                samples_50ms = self._opts.sample_rate // 20
+                bstream = audio_utils.AudioByteStream(
+                    sample_rate=self._opts.sample_rate,
+                    num_channels=1,
+                    samples_per_channel=samples_50ms,
+                )
+                pending_commit = False
+                async for data in self._input_ch:
                     if closed_event.is_set() or ws.closed:
                         return
-                    self._usage_collector.push(frame.duration)
-                    chunk_b64 = base64.b64encode(frame.data.tobytes()).decode("utf-8")
-                    try:
-                        await ws.send_str(
-                            json.dumps(
-                                {
-                                    "message_type": "input_audio_chunk",
-                                    "audio_base_64": chunk_b64,
-                                    "commit": False,
-                                    "sample_rate": self._opts.sample_rate,
-                                }
+                    frames: list[rtc.AudioFrame] = []
+                    if isinstance(data, rtc.AudioFrame):
+                        frames.extend(bstream.write(data.data.tobytes()))
+                    elif isinstance(data, self._FlushSentinel):
+                        frames.extend(bstream.flush())
+                        pending_commit = True
+
+                    for frame in frames:
+                        if closed_event.is_set() or ws.closed:
+                            return
+                        self._usage_collector.push(frame.duration)
+                        chunk_b64 = base64.b64encode(frame.data.tobytes()).decode("utf-8")
+                        try:
+                            await ws.send_str(
+                                _json.dumps(
+                                    {
+                                        "message_type": "input_audio_chunk",
+                                        "audio_base_64": chunk_b64,
+                                        "commit": False,
+                                        "sample_rate": self._opts.sample_rate,
+                                    }
+                                )
                             )
-                        )
-                    except Exception:
-                        logger.warning("failed to send audio chunk to elevenlabs (ws likely closing)", exc_info=True)
-                        return
+                            await asyncio.sleep(0.01)
+                        except Exception:
+                            logger.warning("failed to send audio chunk to elevenlabs (ws likely closing)", exc_info=True)
+                            return
 
-                if pending_commit:
-                    pending_commit = False
-                    if closed_event.is_set() or ws.closed:
-                        return
-                    try:
-                        await ws.send_str(
-                            json.dumps(
-                                {
-                                    "message_type": "input_audio_chunk",
-                                    "audio_base_64": "",
-                                    "commit": True,
-                                    "sample_rate": self._opts.sample_rate,
-                                }
+                    if pending_commit:
+                        pending_commit = False
+                        if closed_event.is_set() or ws.closed:
+                            return
+                        try:
+                            await ws.send_str(
+                                _json.dumps(
+                                    {
+                                        "message_type": "input_audio_chunk",
+                                        "audio_base_64": "",
+                                        "commit": True,
+                                        "sample_rate": self._opts.sample_rate,
+                                    }
+                                )
                             )
+                            await asyncio.sleep(0.01)
+                        except Exception:
+                            logger.warning("failed to send commit to elevenlabs (ws likely closing)", exc_info=True)
+                            return
+                        self._usage_collector.flush()
+                closing_ws = True
+
+            async def recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
+                while True:
+                    msg = await ws.receive()
+                    if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING):
+                        closed_event.set()
+                        if closing_ws or self._session.closed:
+                            return
+                        logger.warning(
+                            "elevenlabs websocket closed unexpectedly",
+                            extra={"code": ws.close_code, "reason": getattr(ws, "close_reason", None)},
                         )
+                        raise APIStatusError(
+                            message=f"elevenlabs connection closed (code={ws.close_code}, reason={getattr(ws, 'close_reason', None)})",
+                            status_code=ws.close_code or -1,
+                        )
+                    if msg.type == aiohttp.WSMsgType.ERROR:
+                        closed_event.set()
+                        logger.warning("elevenlabs websocket error", extra={"exception": ws.exception()})
+                        raise APIStatusError(message="elevenlabs websocket error", status_code=-1)
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        logger.warning("unexpected elevenlabs message type %s", msg.type)
+                        continue
+                    try:
+                        self._process_stream_event(_json.loads(msg.data))
                     except Exception:
-                        logger.warning("failed to send commit to elevenlabs (ws likely closing)", exc_info=True)
-                        return
-                    self._usage_collector.flush()
-            # mark that we're done sending; recv_task can decide whether close was expected
-            nonlocal closing_ws
-            closing_ws = True
+                        logger.exception("failed to process elevenlabs message")
 
-        async def recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
-            while True:
-                msg = await ws.receive()
-                if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING):
-                    closed_event.set()
-                    # if we initiated close by finishing send, or session is closing, exit quietly
-                    if closing_ws or self._session.closed:
-                        return
-                    # unexpected close -> trigger retry via APIStatusError
-                    raise APIStatusError(message="elevenlabs connection closed unexpectedly")
-
-                if msg.type != aiohttp.WSMsgType.TEXT:
-                    logger.warning("unexpected elevenlabs message type %s", msg.type)
-                    continue
+            ws: aiohttp.ClientWebSocketResponse | None = None
+            try:
+                ws = await self._connect_ws()
+                self._ws = ws
+                send = asyncio.create_task(send_task(ws))
+                recv = asyncio.create_task(recv_task(ws))
+                wait_reconnect = asyncio.create_task(self._reconnect_event.wait())
+                group = asyncio.gather(send, recv)
                 try:
-                    self._process_stream_event(json.loads(msg.data))
-                except Exception:
-                    logger.exception("failed to process elevenlabs message")
-
-        ws = await self._connect_ws()
-        self._ws = ws
-        try:
-            await asyncio.gather(send_task(ws), recv_task(ws))
-        finally:
-            await ws.close()
+                    done, _ = await asyncio.wait((group, wait_reconnect), return_when=asyncio.FIRST_COMPLETED)
+                    for t in done:
+                        if t is not wait_reconnect:
+                            t.result()
+                    if wait_reconnect in done:
+                        self._reconnect_event.clear()
+                        # fallthrough to finally to close and reconnect
+                    else:
+                        # normal exit
+                        break
+                finally:
+                    for t in (send, recv, wait_reconnect):
+                        if not t.done():
+                            t.cancel()
+                    try:
+                        await group
+                    except Exception:
+                        pass
+            finally:
+                if ws is not None:
+                    await ws.close()
 
     async def _connect_ws(self) -> aiohttp.ClientWebSocketResponse:
         url = _to_elevenlabs_ws_url(
@@ -360,6 +399,7 @@ class SpeechStreamRealtime(stt.SpeechStream):
                 **({"language_code": self._opts.language_code} if self._opts.language_code else {}),
             },
         )
+        logger.debug("connecting elevenlabs realtime websocket", extra={"url": url})
         try:
             ws = await asyncio.wait_for(
                 self._session.ws_connect(url, headers={AUTHORIZATION_HEADER: self._opts.api_key}, heartbeat=30.0),
