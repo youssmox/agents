@@ -244,6 +244,7 @@ class SpeechStreamRealtime(stt.SpeechStream):
 
     async def _run(self) -> None:
         closed_event = asyncio.Event()
+        closing_ws = False
 
         async def send_task(ws: aiohttp.ClientWebSocketResponse) -> None:
             samples_50ms = self._opts.sample_rate // 20
@@ -302,13 +303,20 @@ class SpeechStreamRealtime(stt.SpeechStream):
                         logger.warning("failed to send commit to elevenlabs (ws likely closing)", exc_info=True)
                         return
                     self._usage_collector.flush()
+            # mark that we're done sending; recv_task can decide whether close was expected
+            nonlocal closing_ws
+            closing_ws = True
 
         async def recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
             while True:
                 msg = await ws.receive()
                 if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING):
                     closed_event.set()
-                    return
+                    # if we initiated close by finishing send, or session is closing, exit quietly
+                    if closing_ws or self._session.closed:
+                        return
+                    # unexpected close -> trigger retry via APIStatusError
+                    raise APIStatusError(message="elevenlabs connection closed unexpectedly")
 
                 if msg.type != aiohttp.WSMsgType.TEXT:
                     logger.warning("unexpected elevenlabs message type %s", msg.type)
