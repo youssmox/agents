@@ -237,6 +237,7 @@ class RealtimeSpeechStream(stt.SpeechStream):
         self._session = http_session
         self._speaking = False
         self._reconnect_event = asyncio.Event()
+        self._session_started = False
 
     def update_options(
         self,
@@ -300,6 +301,12 @@ class RealtimeSpeechStream(stt.SpeechStream):
                     has_ended = True
 
                 for frame in frames:
+                    # Only send audio if session is started
+                    if not self._session_started:
+                        logger.debug("Waiting for session to start before sending audio")
+                        await asyncio.sleep(0.1)
+                        continue
+
                     # Convert to base64 and send
                     chunk_base64 = base64.b64encode(frame.data.tobytes()).decode("utf-8")
                     message = {
@@ -308,6 +315,7 @@ class RealtimeSpeechStream(stt.SpeechStream):
                         "commit": False,
                         "sample_rate": self._opts.sample_rate,
                     }
+                    logger.debug(f"Sending audio chunk: {len(chunk_base64)} chars")
                     await ws.send_str(json.dumps(message))
 
                     if has_ended:
@@ -322,29 +330,37 @@ class RealtimeSpeechStream(stt.SpeechStream):
         @utils.log_exceptions(logger=logger)
         async def recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
             nonlocal closing_ws
-            while True:
-                msg = await ws.receive()
-                if msg.type in (
-                    aiohttp.WSMsgType.CLOSED,
-                    aiohttp.WSMsgType.CLOSE,
-                    aiohttp.WSMsgType.CLOSING,
-                ):
-                    # close is expected, see SpeechStream.aclose
-                    # or when the agent session ends, the http session is closed
-                    if closing_ws or self._session.closed:
-                        return
+            try:
+                async for message in ws:
+                    if message.type in (
+                        aiohttp.WSMsgType.CLOSED,
+                        aiohttp.WSMsgType.CLOSE,
+                        aiohttp.WSMsgType.CLOSING,
+                    ):
+                        # close is expected, see SpeechStream.aclose
+                        # or when the agent session ends, the http session is closed
+                        if closing_ws or self._session.closed:
+                            return
 
-                    # this will trigger a reconnection, see the _run loop
-                    raise APIStatusError(message="elevenlabs connection closed unexpectedly")
+                        # this will trigger a reconnection, see the _run loop
+                        raise APIStatusError(message="elevenlabs connection closed unexpectedly")
 
-                if msg.type != aiohttp.WSMsgType.TEXT:
-                    logger.warning("unexpected elevenlabs message type %s", msg.type)
-                    continue
+                    if message.type != aiohttp.WSMsgType.TEXT:
+                        logger.warning("unexpected elevenlabs message type %s", message.type)
+                        continue
 
-                try:
-                    self._process_stream_event(json.loads(msg.data))
-                except Exception:
-                    logger.exception("failed to process elevenlabs message")
+                    try:
+                        data = json.loads(message.data)
+                        logger.debug(f"Received message from ElevenLabs: {data}")
+                        self._process_stream_event(data)
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Failed to parse ElevenLabs message: {e}")
+                    except Exception as e:
+                        logger.exception("failed to process elevenlabs message")
+            except Exception as e:
+                if not closing_ws and not self._session.closed:
+                    logger.error(f"WebSocket error: {e}")
+                    raise APIStatusError(message="elevenlabs connection error") from e
 
         ws: aiohttp.ClientWebSocketResponse | None = None
 
@@ -382,12 +398,16 @@ class RealtimeSpeechStream(stt.SpeechStream):
 
     async def _connect_ws(self) -> aiohttp.ClientWebSocketResponse:
         # Build WebSocket URL with query parameters
-        model_value = self._opts.model.value if isinstance(self._opts.model, RealtimeModels) else self._opts.model
+        model_value = (
+            self._opts.model.value
+            if isinstance(self._opts.model, RealtimeModels)
+            else self._opts.model
+        )
         params = [
             f"model_id={model_value}",
             f"encoding={self._opts.audio_format.value}",
             f"sample_rate={self._opts.sample_rate}",
-            f"commit_strategy={self._opts.commit_strategy.value}"
+            f"commit_strategy={self._opts.commit_strategy.value}",
         ]
 
         # Add optional VAD parameters
@@ -408,6 +428,7 @@ class RealtimeSpeechStream(stt.SpeechStream):
         logger.debug(f"Connecting to ElevenLabs realtime WebSocket: {ws_url}")
 
         try:
+            logger.debug(f"Attempting WebSocket connection to: {ws_url}")
             ws = await asyncio.wait_for(
                 self._session.ws_connect(
                     ws_url,
@@ -417,6 +438,10 @@ class RealtimeSpeechStream(stt.SpeechStream):
                 self._conn_options.timeout,
             )
             logger.debug("Successfully connected to ElevenLabs realtime WebSocket")
+
+            # Wait a moment for the session to be established
+            await asyncio.sleep(0.1)
+
         except (aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:
             logger.error(f"Failed to connect to ElevenLabs: {e}")
             raise APIConnectionError("failed to connect to elevenlabs") from e
@@ -436,12 +461,15 @@ class RealtimeSpeechStream(stt.SpeechStream):
 
     def _process_stream_event(self, data: dict) -> None:
         message_type = data.get("message_type")
+        logger.debug(f"Processing ElevenLabs event: {message_type}")
 
         if message_type == "session_started":
+            logger.info("ElevenLabs session started")
+            self._session_started = True
             # Session started successfully
-            pass
 
         elif message_type == "partial_transcript":
+            logger.debug(f"Received partial transcript: {data}")
             if not self._speaking:
                 self._speaking = True
                 start_event = stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
@@ -450,8 +478,12 @@ class RealtimeSpeechStream(stt.SpeechStream):
             self._send_transcript_event(stt.SpeechEventType.INTERIM_TRANSCRIPT, data)
 
         elif message_type == "committed_transcript":
+            logger.debug(f"Received committed transcript: {data}")
             if not self._speaking:
-                return
+                # Sometimes we get committed transcript without partial first
+                self._speaking = True
+                start_event = stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
+                self._event_ch.send_nowait(start_event)
 
             self._send_transcript_event(stt.SpeechEventType.FINAL_TRANSCRIPT, data)
             self._speaking = False
@@ -459,22 +491,28 @@ class RealtimeSpeechStream(stt.SpeechStream):
             self._event_ch.send_nowait(end_event)
 
         elif message_type == "error":
-            logger.warning("elevenlabs sent an error", extra={"data": data})
-            desc = data.get("error") or "unknown error from elevenlabs"
-            code = -1
+            logger.error("ElevenLabs sent an error", extra={"data": data})
+            desc = data.get("error") or data.get("message") or "unknown error from elevenlabs"
+            code = data.get("code", -1)
             raise APIStatusError(message=desc, status_code=code)
+
+        else:
+            logger.debug(f"Unhandled ElevenLabs message type: {message_type}")
 
 
 def _parse_transcription(language: str, data: dict[str, Any]) -> list[stt.SpeechData]:
     transcript = data.get("transcript")
     if not transcript:
+        logger.debug("No transcript in ElevenLabs response")
         return []
 
     # For ElevenLabs realtime, we don't get detailed timing info in all cases
     # Use what's available
-    start_time = data.get("audio_start", 0)
-    end_time = data.get("audio_end", 0)
+    start_time = data.get("audio_start", data.get("start_time", 0))
+    end_time = data.get("audio_end", data.get("end_time", 0))
     confidence = data.get("confidence", 1.0)
+
+    logger.debug(f"Parsed transcription: '{transcript}' (confidence: {confidence})")
 
     sd = stt.SpeechData(
         language=language,
